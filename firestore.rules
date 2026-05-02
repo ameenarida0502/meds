@@ -1,0 +1,88 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Default deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Helper functions
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isDoctor() {
+      return isSignedIn() && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'doctor';
+    }
+
+    // --- Users Collection ---
+    match /users/{userId} {
+      allow get: if isValidId(userId) && (
+        isOwner(userId) || (
+          isDoctor() &&
+          existing().role == 'patient' &&
+          existing().isSharingEnabled == true
+        )
+      );
+      
+      allow list: if isSignedIn() && isOwner(userId) && resource.data.id == request.auth.uid;
+
+      allow create: if isValidId(userId) && isOwner(userId) && 
+                      incoming().keys().hasAll(['id', 'role', 'name', 'email']) &&
+                      incoming().keys().size() >= 4 &&
+                      incoming().role in ['patient', 'doctor'] &&
+                      incoming().id == request.auth.uid &&
+                      incoming().email == request.auth.token.email;
+
+      allow update: if isValidId(userId) && isOwner(userId) && (
+        // Patient updating profile or sharing toggle
+        (existing().role == 'patient' && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'address', 'age', 'gender', 'bloodGroup', 'isSharingEnabled'])) ||
+        // Doctor updating profile
+        (existing().role == 'doctor' && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'address', 'degree']))
+      );
+    }
+
+    // --- Records Collection ---
+    match /records/{recordId} {
+      allow get: if isValidId(recordId) && isSignedIn() && (
+        isOwner(existing().patientId) || (
+          isDoctor() &&
+          get(/databases/$(database)/documents/users/$(existing().patientId)).data.isSharingEnabled == true
+        )
+      );
+
+      allow list: if isSignedIn() && (
+        (request.query.filters.patientId == request.auth.uid) ||
+        (
+          isDoctor() &&
+          get(/databases/$(database)/documents/users/$(request.query.filters.patientId)).data.isSharingEnabled == true
+        )
+      );
+
+      allow create: if isValidId(recordId) && isSignedIn() && 
+                      isOwner(incoming().patientId) &&
+                      incoming().keys().hasAll(['id', 'patientId', 'fileURL', 'type', 'createdAt']) &&
+                      incoming().keys().size() >= 5 &&
+                      incoming().type in ['prescription', 'report'] &&
+                      incoming().createdAt == request.time;
+      
+      allow delete: if isValidId(recordId) && isSignedIn() && isOwner(existing().patientId);
+    }
+  }
+}
